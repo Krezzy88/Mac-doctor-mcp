@@ -1,0 +1,9 @@
+{
+  "servers": {
+    "mac-doctor-mcp": {
+      "type": "stdio",
+      "command": "/opt/homebrew/bin/node",
+      "args": ["${workspaceFolder}/dist/index.js"]
+    }
+  }
+}

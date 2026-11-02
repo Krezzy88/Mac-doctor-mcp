@@ -12,7 +12,9 @@ import {
 import { SecurityGuard } from "./security.js";
 import {
   analyzeCaches,
+  diagnoseDiskPressure,
   type CacheDefinition,
+  type DiagnosticAreaDefinition,
   findLargeFiles,
   findLargeFilesArguments,
   type ExecFileRunner,
@@ -20,7 +22,7 @@ import {
 
 const MEBIBYTE = 1024 * 1024;
 
-describe("find_large_files", () => {
+describe("tool operations", () => {
   let temporaryDirectory!: string;
   let allowedDirectory!: string;
   let largeFile!: string;
@@ -41,6 +43,217 @@ describe("find_large_files", () => {
       writeFile(secondLargeFile, Buffer.alloc(3 * MEBIBYTE)),
       writeFile(smallFile, Buffer.alloc(MEBIBYTE - 1)),
     ]);
+  });
+
+  describe("diagnose_disk_pressure", () => {
+    let temporaryDirectory!: string;
+    let allowedDirectory!: string;
+
+    beforeEach(async () => {
+      temporaryDirectory = await mkdtemp(join(tmpdir(), "mac-doctor-triage-"));
+      const target = join(temporaryDirectory, "Projects");
+      await mkdir(target);
+      allowedDirectory = await realpath(target);
+    });
+
+    afterEach(async () => {
+      await rm(temporaryDirectory, { recursive: true, force: true });
+    });
+
+    it("reports measured areas, missing locations, risk, and disk pressure", async () => {
+      const largeAreaPath = join(allowedDirectory, "docker-data");
+      const smallAreaPath = join(allowedDirectory, "npm-cache");
+      await Promise.all([mkdir(largeAreaPath), mkdir(smallAreaPath)]);
+      const areas: DiagnosticAreaDefinition[] = [
+        {
+          id: "npm",
+          name: "npm cache",
+          category: "cache",
+          paths: [smallAreaPath],
+          cleanupRisk: "review",
+          recommendation: "Review package-manager needs.",
+        },
+        {
+          id: "docker",
+          name: "Docker data",
+          category: "developer-data",
+          paths: [largeAreaPath],
+          cleanupRisk: "high",
+          recommendation: "Use Docker Desktop to review disk usage.",
+        },
+        {
+          id: "missing",
+          name: "Missing area",
+          category: "user-files",
+          paths: [join(allowedDirectory, "not-created")],
+          cleanupRisk: "high",
+          recommendation: "Review manually.",
+        },
+      ];
+      const runExecFile = vi.fn<ExecFileRunner>(async (_file, args) => ({
+        stdout: `${args[1] === await realpath(largeAreaPath) ? 4096 : 512}\t${args[1]}\n`,
+      }));
+
+      const report = await diagnoseDiskPressure({
+        securityGuard: new SecurityGuard([allowedDirectory]),
+        runExecFile,
+        areas,
+        readVolumeStats: async () => ({
+          bsize: 1024,
+          blocks: 1_000_000,
+          bavail: 40_000,
+        }),
+        now: () => new Date("2026-11-02T00:00:00.000Z"),
+      });
+
+      expect(report).toEqual({
+        generatedAt: "2026-11-02T00:00:00.000Z",
+        readOnly: true,
+        volume: {
+          path: expect.any(String),
+          totalBytes: 1_024_000_000,
+          availableBytes: 40_960_000,
+          availablePercent: 4,
+          pressure: "critical",
+        },
+        areas: [
+          {
+            id: "docker",
+            name: "Docker data",
+            category: "developer-data",
+            path: largeAreaPath,
+            sizeBytes: 4_194_304,
+            status: "measured",
+            cleanupRisk: "high",
+            recommendation: "Use Docker Desktop to review disk usage.",
+          },
+          {
+            id: "npm",
+            name: "npm cache",
+            category: "cache",
+            path: smallAreaPath,
+            sizeBytes: 524_288,
+            status: "measured",
+            cleanupRisk: "review",
+            recommendation: "Review package-manager needs.",
+          },
+          {
+            id: "missing",
+            name: "Missing area",
+            category: "user-files",
+            path: null,
+            sizeBytes: null,
+            status: "missing",
+            cleanupRisk: "high",
+            recommendation: "Review manually.",
+          },
+        ],
+      });
+    });
+
+    it.each([
+      [5, "critical"],
+      [5.1, "high"],
+      [10, "high"],
+      [10.1, "moderate"],
+      [20, "moderate"],
+      [20.1, "healthy"],
+    ] as const)(
+      "classifies %.1f%% available disk space as %s",
+      async (availablePercent, pressure) => {
+        const report = await diagnoseDiskPressure({
+          areas: [],
+          readVolumeStats: async () => ({
+            bsize: 1,
+            blocks: 10_000,
+            bavail: Math.round(availablePercent * 100),
+          }),
+        });
+
+        expect(report.volume.pressure).toBe(pressure);
+        expect(report.volume.availablePercent).toBe(availablePercent);
+      },
+    );
+
+    it("surfaces measurement and path-access failures in individual area results", async () => {
+      const outsidePath = join(temporaryDirectory, "outside");
+      await mkdir(outsidePath);
+      const report = await diagnoseDiskPressure({
+        securityGuard: new SecurityGuard([allowedDirectory]),
+        areas: [
+          {
+            id: "outside",
+            name: "Outside area",
+            category: "user-files",
+            paths: [outsidePath],
+            cleanupRisk: "high",
+            recommendation: "Review manually.",
+          },
+        ],
+        readVolumeStats: async () => ({
+          bsize: 1,
+          blocks: 100,
+          bavail: 50,
+        }),
+      });
+
+      expect(report.areas[0]).toMatchObject({
+        id: "outside",
+        status: "error",
+        sizeBytes: null,
+        error: "Path Access Denied",
+      });
+    });
+
+    it("fails explicitly when volume statistics are invalid", async () => {
+      await expect(
+        diagnoseDiskPressure({
+          areas: [],
+          readVolumeStats: async () => ({
+            bsize: 1,
+            blocks: Number.MAX_SAFE_INTEGER + 1,
+            bavail: 10,
+          }),
+        }),
+      ).rejects.toThrow("Could not read valid disk capacity information");
+    });
+
+    it("preserves du failures and reports invalid output", async () => {
+      const areaPath = join(allowedDirectory, "unreadable");
+      await mkdir(areaPath);
+      const area: DiagnosticAreaDefinition = {
+        id: "unreadable",
+        name: "Unreadable area",
+        category: "cache",
+        paths: [areaPath],
+        cleanupRisk: "review",
+        recommendation: "Retry after checking permissions.",
+      };
+
+      const failedReport = await diagnoseDiskPressure({
+        securityGuard: new SecurityGuard([allowedDirectory]),
+        runExecFile: vi.fn<ExecFileRunner>(async () => {
+          throw new Error("du timed out");
+        }),
+        areas: [area],
+        readVolumeStats: async () => ({ bsize: 1, blocks: 100, bavail: 50 }),
+      });
+      expect(failedReport.areas[0]).toMatchObject({
+        status: "error",
+        error: "du timed out",
+      });
+
+      const malformedReport = await diagnoseDiskPressure({
+        securityGuard: new SecurityGuard([allowedDirectory]),
+        runExecFile: vi.fn<ExecFileRunner>(async () => ({ stdout: "unknown\n" })),
+        areas: [area],
+        readVolumeStats: async () => ({ bsize: 1, blocks: 100, bavail: 50 }),
+      });
+      expect(malformedReport.areas[0]).toMatchObject({
+        status: "error",
+        error: "Could not parse disk usage for Unreadable area",
+      });
+    });
   });
 
   afterEach(async () => {

@@ -1,7 +1,7 @@
 {
   "name": "mcp-mac-doctor",
   "version": "1.0.0",
-  "description": "Read-only macOS diagnostics for developer caches and large files, exposed as MCP tools.",
+  "description": "Read-only macOS disk triage for developer caches, large files, and disk pressure, exposed as MCP tools.",
   "main": "./dist/index.js",
   "exports": {
     ".": "./dist/index.js"
